@@ -1,4 +1,4 @@
-# simple_userbot.py
+# complete_userbot.py
 import asyncio
 import logging
 import json
@@ -16,7 +16,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class SimpleUserBot:
+class CompleteUserBot:
     def __init__(self):
         # These will be set during setup
         self.api_id = None
@@ -31,6 +31,10 @@ class SimpleUserBot:
         self.is_sending = False
         self.send_task = None
         
+        # Reply system
+        self.reply_group_id = None  # Group where replies will be forwarded
+        self.reply_mapping = {}  # Maps reply_group_message_id -> original message info
+        
         # Load saved config
         self.load_config()
     
@@ -43,6 +47,8 @@ class SimpleUserBot:
                     self.ads = data.get('ads', [])
                     self.target_groups = data.get('target_groups', [])
                     self.interval_minutes = data.get('interval_minutes', 5)
+                    self.reply_group_id = data.get('reply_group_id')
+                    self.reply_mapping = data.get('reply_mapping', {})
                 logger.info("Loaded saved configuration")
             except Exception as e:
                 logger.error(f"Error loading config: {e}")
@@ -52,7 +58,9 @@ class SimpleUserBot:
         data = {
             'ads': self.ads,
             'target_groups': self.target_groups,
-            'interval_minutes': self.interval_minutes
+            'interval_minutes': self.interval_minutes,
+            'reply_group_id': self.reply_group_id,
+            'reply_mapping': self.reply_mapping
         }
         try:
             with open('userbot_data.json', 'w') as f:
@@ -84,7 +92,27 @@ class SimpleUserBot:
             print(f"\n✅ Successfully logged in as: {me.first_name} (@{me.username})")
             
             # Send welcome message
-            await self.client.send_message('me', "🤖 UserBot is now active!\nType .help to see available commands.")
+            welcome = """🤖 UserBot is now active!
+
+**Commands:**
+.add <text> - Add ad
+.remove <num> - Remove ad  
+.listads - List all ads
+.time <mins> - Set interval
+.group <id/username> - Add group
+.rmgroup <id/username> - Remove group
+.listgroups - List groups
+.start - Start sending
+.stop - Stop sending
+
+**Reply System:**
+.setreplygroup <id/username> - Set reply forwarding group
+.replystatus - Show reply system status
+
+.status - Show all status
+.help - Show this help"""
+
+            await self.client.send_message('me', welcome)
             
             return True
         except Exception as e:
@@ -98,6 +126,7 @@ class SimpleUserBot:
         except Exception as e:
             logger.error(f"Error sending message: {e}")
     
+    # ============ AD SYSTEM ============
     async def add_ad(self, text):
         """Add advertisement text"""
         self.ads.append(text)
@@ -139,6 +168,7 @@ class SimpleUserBot:
         except ValueError:
             await self.send_message_to_self("❌ Please enter a valid number!")
     
+    # ============ GROUP MANAGEMENT ============
     async def add_group(self, group_input):
         """Add target group"""
         try:
@@ -202,6 +232,7 @@ class SimpleUserBot:
         
         await self.send_message_to_self(msg)
     
+    # ============ SENDING SYSTEM ============
     async def send_ad_to_group(self, group_id, ad_text):
         """Send ad to a single group"""
         try:
@@ -290,30 +321,213 @@ class SimpleUserBot:
             await self.send_message_to_self("⏹️ Stopped sending ads")
             logger.info("Stopped sending ads")
     
+    # ============ REPLY SYSTEM ============
+    async def set_reply_group(self, group_input):
+        """Set the group where replies will be forwarded"""
+        try:
+            # Get the group entity
+            if group_input.isdigit():
+                entity = await self.client.get_entity(int(group_input))
+            else:
+                username = group_input.lstrip('@')
+                entity = await self.client.get_entity(username)
+            
+            self.reply_group_id = entity.id
+            self.save_config()
+            
+            group_name = getattr(entity, 'title', None) or getattr(entity, 'first_name', 'Unknown')
+            await self.send_message_to_self(f"✅ Reply group set to: {group_name}\nAll replies will be forwarded here.")
+            
+            # Send test message to reply group
+            await self.client.send_message(
+                self.reply_group_id,
+                "🤖 **Reply System Active**\n\n"
+                "All replies to your messages will be forwarded here.\n"
+                "When you reply to a message in this group, it will be sent back to the original chat!"
+            )
+            
+        except Exception as e:
+            await self.send_message_to_self(f"❌ Could not find group: {group_input}\nError: {str(e)}")
+    
+    async def forward_reply_to_group(self, reply_message):
+        """Forward a reply to the designated reply group"""
+        try:
+            if not self.reply_group_id:
+                return
+            
+            # Get the original message that was replied to
+            original_message = await reply_message.get_reply_message()
+            if not original_message:
+                return
+            
+            # Only forward if the original message was sent by us (the bot)
+            if not original_message.out:
+                return
+            
+            # Get original chat info
+            original_chat = await reply_message.get_chat()
+            original_chat_name = getattr(original_chat, 'title', None) or getattr(original_chat, 'first_name', 'Unknown')
+            
+            # Create forwarded message with context
+            forward_text = f"""**📨 New Reply Received!**
+
+**From:** {reply_message.sender.first_name}
+**In:** {original_chat_name}
+**Reply to:** {original_message.text[:100]}...
+
+---
+**Reply Message:**
+{reply_message.text}
+---
+**Quick Reply:** Send a reply to this message to respond back!"""
+
+            # Send to reply group
+            sent = await self.client.send_message(self.reply_group_id, forward_text)
+            
+            # Store mapping to reply to original later
+            mapping_key = f"{sent.id}_{self.reply_group_id}"
+            self.reply_mapping[mapping_key] = {
+                'original_chat_id': original_chat.id,
+                'original_message_id': original_message.id,
+                'reply_group_id': self.reply_group_id,
+                'forwarded_message_id': sent.id,
+                'timestamp': datetime.now().isoformat()
+            }
+            self.save_config()
+            
+            logger.info(f"Forwarded reply from {original_chat_name} to reply group")
+            
+        except Exception as e:
+            logger.error(f"Error forwarding reply: {e}")
+    
+    async def auto_reply_to_original(self, message):
+        """When user replies in reply group, send back to original chat"""
+        try:
+            # Check if message is in reply group
+            if message.chat_id != self.reply_group_id:
+                return
+            
+            # Check if it's a reply to a forwarded message
+            if not message.is_reply:
+                return
+            
+            # Get the original forwarded message
+            original_forwarded = await message.get_reply_message()
+            if not original_forwarded:
+                return
+            
+            # Look up mapping
+            mapping_key = f"{original_forwarded.id}_{self.reply_group_id}"
+            
+            if mapping_key not in self.reply_mapping:
+                # Try to find without ID
+                found = False
+                for key, info in self.reply_mapping.items():
+                    if info['forwarded_message_id'] == original_forwarded.id:
+                        mapping_key = key
+                        found = True
+                        break
+                if not found:
+                    return
+            
+            info = self.reply_mapping[mapping_key]
+            
+            # Prepare reply text
+            reply_text = f"**Reply from {message.sender.first_name}:**\n{message.text}"
+            
+            # Send reply to original chat
+            await self.client.send_message(
+                info['original_chat_id'],
+                reply_text,
+                reply_to=info['original_message_id']
+            )
+            
+            # Notify in reply group that reply was sent
+            await self.client.send_message(
+                self.reply_group_id,
+                f"✅ Reply sent back to original chat!"
+            )
+            
+            logger.info(f"Auto-replied to {info['original_chat_id']}")
+            
+        except Exception as e:
+            logger.error(f"Error in auto-reply: {e}")
+            await self.client.send_message(
+                self.reply_group_id,
+                f"❌ Failed to send reply: {str(e)}"
+            )
+    
+    async def reply_status(self):
+        """Show reply system status"""
+        if not self.reply_group_id:
+            await self.send_message_to_self("❌ Reply system not configured!\nUse .setreplygroup <id/username> to set it up.")
+            return
+        
+        try:
+            entity = await self.client.get_entity(self.reply_group_id)
+            group_name = getattr(entity, 'title', None) or getattr(entity, 'first_name', 'Unknown')
+            
+            status = f"""**📨 Reply System Status**
+
+✅ **Active**
+📱 **Reply Group:** {group_name} (ID: {self.reply_group_id})
+📊 **Active Mappings:** {len(self.reply_mapping)}
+
+**How it works:**
+1. When someone replies to your messages, it's forwarded here
+2. Reply to the forwarded message to respond back
+3. Your reply will be sent to the original chat
+
+Use `.clearreplymappings` to clear all mappings"""
+            
+            await self.send_message_to_self(status)
+            
+        except Exception as e:
+            await self.send_message_to_self(f"❌ Error: {str(e)}")
+    
+    async def clear_reply_mappings(self):
+        """Clear all reply mappings"""
+        self.reply_mapping = {}
+        self.save_config()
+        await self.send_message_to_self("✅ Cleared all reply mappings")
+    
+    # ============ STATUS SYSTEM ============
     async def show_status(self):
         """Show current status"""
         status = f"""📊 **UserBot Status**
 
-✅ **Ads:** {len(self.ads)} ad(s)
-⏱️ **Interval:** {self.interval_minutes} minute(s)
-👥 **Target Groups:** {len(self.target_groups)} group(s)
-🔄 **Sending:** {'✅ Active' if self.is_sending else '❌ Stopped'}
+**Ad System:**
+✅ Ads: {len(self.ads)} ad(s)
+⏱️ Interval: {self.interval_minutes} minute(s)
+👥 Target Groups: {len(self.target_groups)} group(s)
+🔄 Sending: {'✅ Active' if self.is_sending else '❌ Stopped'}
+
+**Reply System:**
+📨 Reply Group: {'✅ Set' if self.reply_group_id else '❌ Not set'}
+🔄 Active Mappings: {len(self.reply_mapping)}
 
 **Commands:**
-.add <text> - Add ad
-.remove <num> - Remove ad
-.listads - List all ads
-.time <mins> - Set interval
-.group <id/username> - Add group
-.rmgroup <id/username> - Remove group
-.listgroups - List groups
-.start - Start sending
-.stop - Stop sending
-.status - Show status
-.help - Show this help"""
+📝 .add <text> - Add ad
+🗑️ .remove <num> - Remove ad
+📋 .listads - List all ads
+⏰ .time <mins> - Set interval
+👥 .group <id/username> - Add group
+❌ .rmgroup <id/username> - Remove group
+📊 .listgroups - List groups
+▶️ .start - Start sending
+⏹️ .stop - Stop sending
+
+**Reply Commands:**
+📨 .setreplygroup <id/username> - Set reply group
+📊 .replystatus - Show reply system status
+🧹 .clearreplymappings - Clear reply mappings
+
+💡 .status - Show this status
+❓ .help - Show this help"""
         
         await self.send_message_to_self(status)
     
+    # ============ COMMAND HANDLER ============
     async def handle_commands(self, event):
         """Handle incoming commands"""
         message = event.message.text.strip()
@@ -370,6 +584,18 @@ class SimpleUserBot:
         elif cmd == '.stop':
             await self.stop_sending()
         
+        elif cmd == '.setreplygroup':
+            if arg:
+                await self.set_reply_group(arg)
+            else:
+                await self.send_message_to_self("❌ Usage: .setreplygroup <id/username>")
+        
+        elif cmd == '.replystatus':
+            await self.reply_status()
+        
+        elif cmd == '.clearreplymappings':
+            await self.clear_reply_mappings()
+        
         elif cmd == '.status':
             await self.show_status()
         
@@ -381,7 +607,7 @@ class SimpleUserBot:
 
 async def main():
     """Main function"""
-    bot = SimpleUserBot()
+    bot = CompleteUserBot()
     
     # Setup and login
     if not await bot.setup():
@@ -392,10 +618,20 @@ async def main():
     print("📝 Send commands in your Saved Messages")
     print("💡 Type .help to see all commands")
     
-    # Register command handler
+    # Register command handler for Saved Messages
     @bot.client.on(events.NewMessage(from_users='me'))
-    async def handler(event):
+    async def command_handler(event):
         await bot.handle_commands(event)
+    
+    # Register reply handler for all messages
+    @bot.client.on(events.NewMessage)
+    async def reply_handler(event):
+        # Handle forwarding replies to reply group
+        if event.message.is_reply and not event.out:
+            await bot.forward_reply_to_group(event.message)
+        
+        # Handle auto-reply from reply group
+        await bot.auto_reply_to_original(event.message)
     
     # Keep running
     try:
