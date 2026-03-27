@@ -1,4 +1,4 @@
-# complete_userbot.py
+# working_userbot.py
 import asyncio
 import logging
 import json
@@ -16,7 +16,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class CompleteUserBot:
+class WorkingUserBot:
     def __init__(self):
         # These will be set during setup
         self.api_id = None
@@ -31,9 +31,9 @@ class CompleteUserBot:
         self.is_sending = False
         self.send_task = None
         
-        # Reply system
+        # Reply system - using message ID as key for better tracking
         self.reply_group_id = None  # Group where replies will be forwarded
-        self.reply_mapping = {}  # Maps reply_group_message_id -> original message info
+        self.reply_mapping = {}  # Maps forwarded message ID -> original info
         
         # Load saved config
         self.load_config()
@@ -321,7 +321,7 @@ class CompleteUserBot:
             await self.send_message_to_self("⏹️ Stopped sending ads")
             logger.info("Stopped sending ads")
     
-    # ============ REPLY SYSTEM ============
+    # ============ FIXED REPLY SYSTEM ============
     async def set_reply_group(self, group_input):
         """Set the group where replies will be forwarded"""
         try:
@@ -339,12 +339,27 @@ class CompleteUserBot:
             await self.send_message_to_self(f"✅ Reply group set to: {group_name}\nAll replies will be forwarded here.")
             
             # Send test message to reply group
-            await self.client.send_message(
+            test_msg = await self.client.send_message(
                 self.reply_group_id,
                 "🤖 **Reply System Active**\n\n"
-                "All replies to your messages will be forwarded here.\n"
-                "When you reply to a message in this group, it will be sent back to the original chat!"
+                "✅ This is your reply group!\n\n"
+                "**How it works:**\n"
+                "1. When someone replies to your messages, they'll appear here\n"
+                "2. Reply to this message to test the system\n"
+                "3. Your reply will be sent back to where the original message came from"
             )
+            
+            # Store this test message mapping
+            mapping_key = f"test_{test_msg.id}"
+            self.reply_mapping[mapping_key] = {
+                'original_chat_id': 'me',
+                'original_message_id': test_msg.id,
+                'reply_group_id': self.reply_group_id,
+                'forwarded_message_id': test_msg.id,
+                'is_test': True,
+                'timestamp': datetime.now().isoformat()
+            }
+            self.save_config()
             
         except Exception as e:
             await self.send_message_to_self(f"❌ Could not find group: {group_input}\nError: {str(e)}")
@@ -358,11 +373,21 @@ class CompleteUserBot:
             # Get the original message that was replied to
             original_message = await reply_message.get_reply_message()
             if not original_message:
+                logger.info("No original message found")
                 return
             
             # Only forward if the original message was sent by us (the bot)
             if not original_message.out:
+                logger.info("Original message not sent by us, skipping")
                 return
+            
+            # Get sender info
+            sender = reply_message.sender
+            sender_name = sender.first_name
+            if sender.last_name:
+                sender_name += f" {sender.last_name}"
+            if sender.username:
+                sender_name += f" (@{sender.username})"
             
             # Get original chat info
             original_chat = await reply_message.get_chat()
@@ -371,91 +396,137 @@ class CompleteUserBot:
             # Create forwarded message with context
             forward_text = f"""**📨 New Reply Received!**
 
-**From:** {reply_message.sender.first_name}
+**From:** {sender_name}
 **In:** {original_chat_name}
-**Reply to:** {original_message.text[:100]}...
+**Replied to:** {original_message.text[:200]}...
 
 ---
 **Reply Message:**
 {reply_message.text}
 ---
-**Quick Reply:** Send a reply to this message to respond back!"""
+**To reply:** Send a reply to this message and it will be sent back!"""
 
             # Send to reply group
             sent = await self.client.send_message(self.reply_group_id, forward_text)
             
-            # Store mapping to reply to original later
+            # Store mapping with unique key
             mapping_key = f"{sent.id}_{self.reply_group_id}"
             self.reply_mapping[mapping_key] = {
                 'original_chat_id': original_chat.id,
                 'original_message_id': original_message.id,
                 'reply_group_id': self.reply_group_id,
                 'forwarded_message_id': sent.id,
+                'original_reply_id': reply_message.id,
+                'original_sender': sender_name,
+                'original_chat_name': original_chat_name,
                 'timestamp': datetime.now().isoformat()
             }
             self.save_config()
             
-            logger.info(f"Forwarded reply from {original_chat_name} to reply group")
+            logger.info(f"Forwarded reply from {original_chat_name} to reply group. Mapping: {mapping_key}")
+            
+            # Send confirmation
+            await self.send_message_to_self(f"📨 Reply forwarded from {original_chat_name}")
             
         except Exception as e:
             logger.error(f"Error forwarding reply: {e}")
+            await self.send_message_to_self(f"❌ Error forwarding reply: {str(e)}")
     
     async def auto_reply_to_original(self, message):
         """When user replies in reply group, send back to original chat"""
         try:
             # Check if message is in reply group
-            if message.chat_id != self.reply_group_id:
+            if not self.reply_group_id or message.chat_id != self.reply_group_id:
                 return
             
             # Check if it's a reply to a forwarded message
             if not message.is_reply:
+                logger.info("Message not a reply, skipping auto-reply")
                 return
             
             # Get the original forwarded message
             original_forwarded = await message.get_reply_message()
             if not original_forwarded:
+                logger.info("Could not get original forwarded message")
                 return
             
+            logger.info(f"Processing reply in reply group. Forwarded message ID: {original_forwarded.id}")
+            
             # Look up mapping
-            mapping_key = f"{original_forwarded.id}_{self.reply_group_id}"
+            found_mapping = None
+            for key, info in self.reply_mapping.items():
+                if info.get('forwarded_message_id') == original_forwarded.id:
+                    found_mapping = info
+                    logger.info(f"Found mapping: {key}")
+                    break
             
-            if mapping_key not in self.reply_mapping:
-                # Try to find without ID
-                found = False
-                for key, info in self.reply_mapping.items():
-                    if info['forwarded_message_id'] == original_forwarded.id:
-                        mapping_key = key
-                        found = True
-                        break
-                if not found:
-                    return
+            if not found_mapping:
+                logger.info(f"No mapping found for forwarded message ID: {original_forwarded.id}")
+                await self.client.send_message(
+                    self.reply_group_id,
+                    "❌ Could not find original message. This mapping may have expired.",
+                    reply_to=message.id
+                )
+                return
             
-            info = self.reply_mapping[mapping_key]
+            # Don't auto-reply to test messages
+            if found_mapping.get('is_test'):
+                await self.client.send_message(
+                    self.reply_group_id,
+                    "✅ Test successful! Your reply system is working.\n\n"
+                    "This was just a test. Real replies will work the same way!",
+                    reply_to=message.id
+                )
+                return
             
             # Prepare reply text
-            reply_text = f"**Reply from {message.sender.first_name}:**\n{message.text}"
+            sender_name = message.sender.first_name
+            if message.sender.last_name:
+                sender_name += f" {message.sender.last_name}"
+            
+            reply_text = f"**Reply from {sender_name}:**\n{message.text}"
             
             # Send reply to original chat
-            await self.client.send_message(
-                info['original_chat_id'],
-                reply_text,
-                reply_to=info['original_message_id']
-            )
-            
-            # Notify in reply group that reply was sent
-            await self.client.send_message(
-                self.reply_group_id,
-                f"✅ Reply sent back to original chat!"
-            )
-            
-            logger.info(f"Auto-replied to {info['original_chat_id']}")
+            try:
+                sent = await self.client.send_message(
+                    found_mapping['original_chat_id'],
+                    reply_text,
+                    reply_to=found_mapping['original_message_id']
+                )
+                
+                logger.info(f"Auto-replied to {found_mapping['original_chat_id']}")
+                
+                # Notify in reply group that reply was sent
+                await self.client.send_message(
+                    self.reply_group_id,
+                    f"✅ Reply sent back to **{found_mapping.get('original_chat_name', 'original chat')}**!\n\n"
+                    f"Your reply: {message.text[:100]}...",
+                    reply_to=message.id
+                )
+                
+                # Optional: Remove mapping after use
+                # del self.reply_mapping[key]
+                # self.save_config()
+                
+            except Exception as e:
+                error_msg = f"❌ Failed to send reply: {str(e)}"
+                logger.error(error_msg)
+                await self.client.send_message(
+                    self.reply_group_id,
+                    error_msg,
+                    reply_to=message.id
+                )
             
         except Exception as e:
             logger.error(f"Error in auto-reply: {e}")
-            await self.client.send_message(
-                self.reply_group_id,
-                f"❌ Failed to send reply: {str(e)}"
-            )
+            try:
+                await self.client.send_message(
+                    self.reply_group_id,
+                    f"❌ Auto-reply error: {str(e)}",
+                    reply_to=message.id if message else None
+                )
+            except:
+                pass
     
     async def reply_status(self):
         """Show reply system status"""
@@ -467,18 +538,28 @@ class CompleteUserBot:
             entity = await self.client.get_entity(self.reply_group_id)
             group_name = getattr(entity, 'title', None) or getattr(entity, 'first_name', 'Unknown')
             
+            # Count active mappings (excluding test ones)
+            active_mappings = {k: v for k, v in self.reply_mapping.items() if not v.get('is_test')}
+            
             status = f"""**📨 Reply System Status**
 
 ✅ **Active**
 📱 **Reply Group:** {group_name} (ID: {self.reply_group_id})
-📊 **Active Mappings:** {len(self.reply_mapping)}
+📊 **Active Mappings:** {len(active_mappings)}
+🔄 **Total Mappings:** {len(self.reply_mapping)}
 
 **How it works:**
 1. When someone replies to your messages, it's forwarded here
 2. Reply to the forwarded message to respond back
 3. Your reply will be sent to the original chat
 
-Use `.clearreplymappings` to clear all mappings"""
+**Test it:**
+- Send a test reply to the welcome message in your reply group
+- The bot will confirm if it's working
+
+**Commands:**
+`.clearreplymappings` - Clear all mappings
+`.replystatus` - Show this status"""
             
             await self.send_message_to_self(status)
             
@@ -494,6 +575,8 @@ Use `.clearreplymappings` to clear all mappings"""
     # ============ STATUS SYSTEM ============
     async def show_status(self):
         """Show current status"""
+        active_mappings = {k: v for k, v in self.reply_mapping.items() if not v.get('is_test')}
+        
         status = f"""📊 **UserBot Status**
 
 **Ad System:**
@@ -504,7 +587,7 @@ Use `.clearreplymappings` to clear all mappings"""
 
 **Reply System:**
 📨 Reply Group: {'✅ Set' if self.reply_group_id else '❌ Not set'}
-🔄 Active Mappings: {len(self.reply_mapping)}
+🔄 Active Mappings: {len(active_mappings)}
 
 **Commands:**
 📝 .add <text> - Add ad
@@ -607,7 +690,7 @@ Use `.clearreplymappings` to clear all mappings"""
 
 async def main():
     """Main function"""
-    bot = CompleteUserBot()
+    bot = WorkingUserBot()
     
     # Setup and login
     if not await bot.setup():
