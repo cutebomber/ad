@@ -1,0 +1,10 @@
+{
+    "api_id": 123456,
+    "api_hash": "your_api_hash_here",
+    "session_string": "your_session_string_here",
+    "ads": [],
+    "target_groups": [],
+    "interval_minutes": 5,
+    "reply_group_id": null,
+    "reply_mapping": {}
+}
